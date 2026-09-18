@@ -73,6 +73,7 @@ $ rain --dry-run 12 14 15
 --max-wait <DURATION>      total time rain may sleep on usage limits (default: 8h)
 --no-wait-on-limit         stop on a usage limit instead of sleeping
 --ignore-relationships     work the issues in the order given
+--ignore-linked-branches   always cut a new branch, never reuse a linked one
 --keep-worktrees           leave worktrees behind for debugging
 -v, --verbose              log every git, gh and agent action
 ```
@@ -95,10 +96,13 @@ worktree → implement → push → open draft PR → CI ⇄ fix (≤ N) → rev
    rain prints is the queue rain works. A dependency cycle is reported, not
    fatal.
 
-2. **Worktree.** A fresh worktree on `rain/issue-N`, cut from the base branch.
-   The branch is created with `--no-track`, so a bare `git push` inside it
-   cannot land on the base branch. A leftover worktree from a crashed run is
-   reclaimed rather than orphaned; a branch name already in use gets a suffix.
+2. **Branch.** If GitHub already has a branch linked to the issue, rain works on
+   that one and targets the branch it was cut from — see [Branches rain did not
+   create](#branches-rain-did-not-create). Otherwise a fresh worktree on
+   `rain/issue-N`, cut from the base branch. A new branch is created with
+   `--no-track`, so a bare `git push` inside it cannot land on the base branch.
+   A leftover worktree from a crashed run is reclaimed rather than orphaned; a
+   branch name already in use gets a suffix.
 
 3. **Implement.** A headless Claude Code session reads the issue, explores the
    codebase, makes the change, adds tests, runs the project's own build and test
@@ -120,6 +124,45 @@ worktree → implement → push → open draft PR → CI ⇄ fix (≤ N) → rev
 
 A failure at any stage is an outcome to report, not a reason to abandon the
 remaining issues.
+
+## Branches rain did not create
+
+An issue often has a branch already. Someone used the **Development** panel on
+the issue, or the `create a branch` link, and that branch is where everyone
+involved expects the work to appear. rain uses it instead of cutting
+`rain/issue-N` next to it, and continues whatever commits are already on it
+rather than starting again.
+
+Such a branch is not always cut from the default branch, and where it came from
+decides where it goes back to. A branch cut from `v3-changes` gets a pull
+request into `v3-changes`; opening it against `main` would put the whole of
+`v3-changes` in the diff and, if merged, land far more than the issue asked
+for.
+
+Git records no such thing as a parent branch, so rain works it out in
+descending order of confidence:
+
+| | |
+|---|---|
+| `--base <BRANCH>` | An explicit flag is an instruction, and settles it. |
+| The open pull request | If the branch already has one, its base was chosen by a person. |
+| The history | The branch rain has fewest commits beyond — cut `feature` from `v3-changes` and it is three commits ahead of `v3-changes`, but three plus the whole of `v3-changes` ahead of `main`. Branches cut _from_ this one are excluded; they are downstream, not upstream. |
+| The default branch | When nothing above answers, or when the history cannot separate two branches. |
+
+The pull request says which of these applied whenever the answer is not the
+default branch, and so does `summary.md`.
+
+Two situations stop the task rather than guess:
+
+- **The branch is checked out elsewhere.** rain will not take a branch out from
+  under another worktree.
+- **The local and remote copies have diverged.** rain may not force-push, so
+  work on a diverged local branch could never be pushed, and discarding either
+  side silently is worse than stopping. A local copy that is merely behind is
+  fast-forwarded.
+
+`--ignore-linked-branches` turns all of this off and always cuts
+`rain/issue-N`.
 
 ## Usage limits
 
@@ -153,7 +196,7 @@ one is a guardrail and two is a guarantee.
 
 | Operation | Blocked by |
 |---|---|
-| Committing or pushing to the base branch | `--no-track` branches, and rain verifying afterwards that none of the task's commits reached the base branch |
+| Committing or pushing to the base branch | an upstream that is never the base branch — `--no-track` on a branch rain cut, the branch's own remote counterpart on one it did not — and rain verifying afterwards that none of the task's commits reached the base branch |
 | Force push, history rewrite, remote branch deletion | denied tool patterns, and a fully-qualified push refspec |
 | Merging a PR, tags, releases, changing remotes | denied tool patterns, and the system prompt |
 | The reviewer changing code | `Edit`, `Write` and the git write commands denied for that session |
