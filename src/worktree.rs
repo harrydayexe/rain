@@ -301,12 +301,7 @@ fn set_upstream(ctx: &RepoContext, branch: &str) {
 /// force-push, so work left on a diverged local branch could never be pushed,
 /// and discarding either side silently is worse than stopping.
 fn reconcile_with_remote(path: &Path, branch: &str, remote_ref: &str) -> Result<()> {
-    let range = format!("HEAD...{remote_ref}");
-    let counts = git::run(path, &["rev-list", "--left-right", "--count", &range])?;
-    let mut fields = counts.split_whitespace();
-    let ahead: usize = fields.next().unwrap_or("0").parse().unwrap_or(0);
-    let behind: usize = fields.next().unwrap_or("0").parse().unwrap_or(0);
-
+    let (ahead, behind) = git::divergence(path, "HEAD", remote_ref)?;
     match (ahead, behind) {
         (_, 0) => Ok(()),
         (0, _) => {

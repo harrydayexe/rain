@@ -65,6 +65,25 @@ pub fn probe(dir: &Path, args: &[&str]) -> bool {
     try_run(dir, args).map(|o| o.success()).unwrap_or(false)
 }
 
+/// How many commits each of two refs has that the other does not.
+///
+/// One `rev-list` answers both halves: commits on `ours` that `theirs` lacks,
+/// then commits on `theirs` that `ours` lacks. Refs with no common ancestor are
+/// not an error — every commit on each side counts as its own.
+pub fn divergence(dir: &Path, ours: &str, theirs: &str) -> Result<(usize, usize)> {
+    let range = format!("{ours}...{theirs}");
+    let out = run(dir, &["rev-list", "--left-right", "--count", &range])?;
+    parse_divergence(&out)
+        .ok_or_else(|| anyhow!("could not read `git rev-list --left-right --count`: {out}"))
+}
+
+fn parse_divergence(out: &str) -> Option<(usize, usize)> {
+    let mut fields = out.split_whitespace();
+    let ours = fields.next()?.parse().ok()?;
+    let theirs = fields.next()?.parse().ok()?;
+    Some((ours, theirs))
+}
+
 /// Stream a git invocation's output straight through to the terminal. Used for
 /// `push`, where progress lines are the only sign anything is happening.
 pub fn run_streaming(dir: &Path, args: &[&str]) -> Result<()> {
@@ -88,4 +107,18 @@ pub fn version() -> Result<String> {
         .output()
         .map_err(|e| anyhow!("git is not installed or not on PATH: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_rev_list_counts() {
+        assert_eq!(parse_divergence("3\t7"), Some((3, 7)));
+        assert_eq!(parse_divergence("0       0\n"), Some((0, 0)));
+        assert_eq!(parse_divergence(""), None);
+        assert_eq!(parse_divergence("3"), None);
+        assert_eq!(parse_divergence("a\tb"), None);
+    }
 }

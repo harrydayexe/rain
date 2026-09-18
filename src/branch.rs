@@ -209,7 +209,7 @@ pub fn infer_parent(ctx: &RepoContext, branch: &str) -> Option<String> {
     let candidates: Vec<Candidate> = candidate_branches(ctx, branch)
         .into_iter()
         .filter_map(|name| {
-            let (ahead, behind) = divergence(ctx, &head, &ctx.remote_ref(&name))?;
+            let (ahead, behind) = git::divergence(&ctx.root, &head, &ctx.remote_ref(&name)).ok()?;
             Some(Candidate {
                 name,
                 ahead,
@@ -288,20 +288,6 @@ fn candidate_branches(ctx: &RepoContext, branch: &str) -> Vec<String> {
         ));
     }
     names
-}
-
-/// How many commits each of two refs has that the other does not.
-fn divergence(ctx: &RepoContext, ours: &str, theirs: &str) -> Option<(usize, usize)> {
-    let range = format!("{ours}...{theirs}");
-    let out = git::run(&ctx.root, &["rev-list", "--left-right", "--count", &range]).ok()?;
-    parse_counts(&out)
-}
-
-fn parse_counts(out: &str) -> Option<(usize, usize)> {
-    let mut fields = out.split_whitespace();
-    let ahead = fields.next()?.parse().ok()?;
-    let behind = fields.next()?.parse().ok()?;
-    Some((ahead, behind))
 }
 
 /// `rain/issue-N`, suffixed if that name is already taken locally or remotely.
@@ -400,14 +386,5 @@ mod tests {
         assert!(rank(&[], "main").is_none());
         // Every candidate already contains our work.
         assert!(rank(&[candidate("main", 0, 4)], "main").is_none());
-    }
-
-    #[test]
-    fn reads_rev_list_counts() {
-        assert_eq!(parse_counts("3\t7"), Some((3, 7)));
-        assert_eq!(parse_counts("0       0\n"), Some((0, 0)));
-        assert_eq!(parse_counts(""), None);
-        assert_eq!(parse_counts("3"), None);
-        assert_eq!(parse_counts("a\tb"), None);
     }
 }
