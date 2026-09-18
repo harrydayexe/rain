@@ -142,15 +142,16 @@ for.
 Git records no such thing as a parent branch, so rain works it out in
 descending order of confidence:
 
-| | |
+| Taken from | Because |
 |---|---|
 | `--base <BRANCH>` | An explicit flag is an instruction, and settles it. |
 | The open pull request | If the branch already has one, its base was chosen by a person. |
 | The history | The branch rain has fewest commits beyond — cut `feature` from `v3-changes` and it is three commits ahead of `v3-changes`, but three plus the whole of `v3-changes` ahead of `main`. Branches cut _from_ this one are excluded; they are downstream, not upstream. |
 | The default branch | When nothing above answers, or when the history cannot separate two branches. |
 
-The pull request says which of these applied whenever the answer is not the
-default branch, and so does `summary.md`.
+A pull request that targets a branch rain worked out for itself says so in its
+own body, and every task records its branch and target in `summary.md` and
+`run.json`.
 
 Two situations stop the task rather than guess:
 
