@@ -149,6 +149,13 @@ descending order of confidence:
 | The history | The branch rain has fewest commits beyond — cut `feature` from `v3-changes` and it is three commits ahead of `v3-changes`, but three plus the whole of `v3-changes` ahead of `main`. Branches cut _from_ this one are excluded; they are downstream, not upstream. |
 | The default branch | When nothing above answers, or when the history cannot separate two branches. |
 
+When the history ties, rain prefers the run's base branch, and then a branch
+whose name does not start with a digit. GitHub names the branch it creates for
+an issue `<number>-<title>`, so when issues #1 and #2 both have a branch cut
+from `baz` and neither has been worked on yet, all three tips are the same
+commit: `2-buzbar` is a sibling of `1-foobar`, not its parent, and `baz` is the
+target.
+
 A pull request that targets a branch rain worked out for itself says so in its
 own body, and every task records its branch and target in `summary.md` and
 `run.json`.
