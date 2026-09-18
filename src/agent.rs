@@ -324,7 +324,7 @@ pub fn run(spec: &AgentSpec) -> Result<AgentRun> {
             spec.label,
             util::format_duration(spec.timeout)
         ));
-        let _ = child.kill();
+        stop(&mut child);
     }
 
     let status = child.wait().context("waiting for the claude process")?;
@@ -349,8 +349,42 @@ pub fn run(spec: &AgentSpec) -> Result<AgentRun> {
     })
 }
 
+/// Kill a timed-out session and everything it started.
+///
+/// Killing only the direct child would leave the commands the agent was running
+/// alive, and any one of them holding our stdout pipe open would block the
+/// reader thread — an unattended run would hang exactly where it must not.
+fn stop(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // `spawn` puts the session in its own process group, so a negative PID
+        // reaches the whole tree.
+        let group = format!("-{}", child.id());
+        let killed = Command::new("kill")
+            .args(["-KILL", &group])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if killed {
+            return;
+        }
+        ui::trace("could not signal the process group; killing the session only");
+    }
+    let _ = child.kill();
+}
+
 fn spawn(spec: &AgentSpec) -> Result<Child> {
     let mut cmd = Command::new("claude");
+
+    // Lead a new process group, so a timeout can take the whole tree down.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     cmd.current_dir(&spec.cwd)
         .arg("--print")
         .arg("--output-format")
@@ -522,13 +556,18 @@ fn classify(timed_out: bool, exit_code: i32, state: &StreamState, stderr: &str) 
         return Outcome::Timeout;
     }
 
-    let failed = state.is_error || exit_code != 0 || !state.saw_result;
+    // A session that finished is a session that finished. Both quota warnings
+    // and limit wording can appear on the output of a run that did all of its
+    // work, and sleeping five hours on one of those would waste the night.
+    // Nothing below this line runs unless the session actually failed.
+    if !(state.is_error || exit_code != 0 || !state.saw_result) {
+        return Outcome::Success;
+    }
 
     // The stream's own quota telemetry is authoritative when it says we are cut
     // off: it names the binding window and its reset time, so no backoff has to
-    // be guessed. Only trust it to end a run that actually failed — a session
-    // can report a limit on its closing event having already done its work.
-    if failed && let Some(quota) = state.quota.as_ref().filter(|q| q.is_exhausted()) {
+    // be guessed.
+    if let Some(quota) = state.quota.as_ref().filter(|q| q.is_exhausted()) {
         return Outcome::UsageLimit(UsageLimit {
             kind: quota.kind(),
             resets_at: quota.reset_for_kind(),
@@ -536,15 +575,9 @@ fn classify(timed_out: bool, exit_code: i32, state: &StreamState, stderr: &str) 
         });
     }
 
-    // Otherwise fall back to the wording. Only trust limit wording from rain's
-    // own channels — the process's stderr, or the agent's closing message when
-    // the run failed. A successful run whose text happens to discuss usage
-    // limits is not a usage limit.
-    let mut haystack = stderr.to_string();
-    if failed {
-        haystack.push('\n');
-        haystack.push_str(&state.result_text);
-    }
+    // Otherwise fall back to the wording, on rain's own channels: the process's
+    // stderr and the agent's closing message.
+    let haystack = format!("{stderr}\n{}", state.result_text);
     if let Some(mut limit) = detect_usage_limit(&haystack) {
         // Prefer a reset time the stream gave us over one scraped from text.
         if limit.resets_at.is_none()
@@ -556,10 +589,6 @@ fn classify(timed_out: bool, exit_code: i32, state: &StreamState, stderr: &str) 
             }
         }
         return Outcome::UsageLimit(limit);
-    }
-
-    if !failed {
-        return Outcome::Success;
     }
 
     let reason = if state.result_subtype == "error_max_turns" {
@@ -622,7 +651,10 @@ fn limit_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(claude\s+ai\s+usage\s+limit\s+reached|usage\s+limit\s+reached|you'?ve\s+reached\s+your\s+(?:usage\s+)?limit|(?:5|five)[-\s]hour\s+limit\s+reached|weekly\s+limit\s+reached|approaching\s+your\s+weekly\s+limit)",
+            // Only wording that means "cut off now". "Approaching your limit"
+            // and similar warnings are deliberately absent: they are printed
+            // while everything still works.
+            r"(?i)(claude\s+ai\s+usage\s+limit\s+reached|usage\s+limit\s+reached|you'?ve\s+reached\s+your\s+(?:usage\s+)?limit|(?:5|five)[-\s]hour\s+limit\s+reached|weekly\s+limit\s+reached)",
         )
         .expect("static regex")
     })
@@ -722,6 +754,37 @@ mod tests {
             r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.5,"result":"Documented what happens when the usage limit reached message appears."}"#,
         );
         assert!(matches!(classify(false, 0, &state, ""), Outcome::Success));
+    }
+
+    #[test]
+    fn a_warning_on_stderr_never_stops_a_finished_session() {
+        let mut state = StreamState::default();
+        state.absorb(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"done"}"#,
+        );
+        // Claude Code prints quota warnings on stderr while everything still
+        // works; treating one as exhaustion would sleep away a working night.
+        assert!(matches!(
+            classify(false, 0, &state, "Warning: approaching your weekly limit\n"),
+            Outcome::Success
+        ));
+    }
+
+    #[test]
+    fn a_limit_on_stderr_of_a_failed_run_is_a_limit() {
+        let mut state = StreamState::default();
+        state.absorb(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":""}"#,
+        );
+        assert!(matches!(
+            classify(
+                false,
+                1,
+                &state,
+                "Claude AI usage limit reached|1780000000\n"
+            ),
+            Outcome::UsageLimit(_)
+        ));
     }
 
     #[test]
