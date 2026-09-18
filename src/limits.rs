@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 
-use crate::agent::{self, AgentRun, AgentSpec, LimitKind, Outcome, UsageLimit};
+use crate::agent::{self, AgentRun, AgentSpec, LimitKind, Outcome, Quota, UsageLimit};
 use crate::ui;
 use crate::util;
 
@@ -50,6 +50,7 @@ pub struct Governor {
     slept: Duration,
     spend: f64,
     sessions: u32,
+    quota: Option<Quota>,
 }
 
 impl Governor {
@@ -59,7 +60,14 @@ impl Governor {
             slept: Duration::ZERO,
             spend: 0.0,
             sessions: 0,
+            quota: None,
         }
+    }
+
+    /// The most recent quota reading of the run — how much of each window is
+    /// gone, and therefore how much is left for the human.
+    pub fn quota(&self) -> Option<&Quota> {
+        self.quota.as_ref()
     }
 
     /// Total notional cost across every session this run — rain's best proxy
@@ -86,6 +94,9 @@ impl Governor {
             let run = agent::run(spec)?;
             self.sessions += 1;
             self.spend += run.cost_usd;
+            if run.quota.is_some() {
+                self.quota = run.quota.clone();
+            }
 
             let Outcome::UsageLimit(limit) = &run.outcome else {
                 return Ok(run);

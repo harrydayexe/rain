@@ -100,6 +100,87 @@ impl LimitKind {
     }
 }
 
+/// Quota telemetry, read from the `rate_limit_event` messages Claude Code emits
+/// on the stream.
+///
+/// This is the answer to "can usage be read programmatically?": it can, and it
+/// is authoritative — both the window that is binding and when it resets come
+/// from the same place the limit itself does, so rain never has to guess a
+/// backoff from an error string.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct Quota {
+    /// `allowed` while there is headroom; anything else means we are cut off.
+    pub status: String,
+    /// `five_hour` or `seven_day` — which window the status refers to.
+    pub limit_type: Option<String>,
+    /// Fraction of the five-hour window consumed, 0.0–1.0.
+    pub five_hour_used: Option<f64>,
+    pub five_hour_resets_at: Option<DateTime<Utc>>,
+    /// Fraction of the weekly window consumed, 0.0–1.0.
+    pub seven_day_used: Option<f64>,
+    pub seven_day_resets_at: Option<DateTime<Utc>>,
+    /// The reset time attached to the event itself.
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+impl Quota {
+    /// Whether the account is currently cut off.
+    pub fn is_exhausted(&self) -> bool {
+        !self.status.is_empty() && !self.status.eq_ignore_ascii_case("allowed")
+    }
+
+    pub fn kind(&self) -> LimitKind {
+        match self.limit_type.as_deref() {
+            Some("seven_day") | Some("weekly") => LimitKind::Weekly,
+            Some("five_hour") => LimitKind::Session,
+            _ => LimitKind::Unknown,
+        }
+    }
+
+    /// When the binding window resets, preferring the window the event names.
+    pub fn reset_for_kind(&self) -> Option<DateTime<Utc>> {
+        match self.kind() {
+            LimitKind::Weekly => self.seven_day_resets_at.or(self.resets_at),
+            LimitKind::Session => self.five_hour_resets_at.or(self.resets_at),
+            LimitKind::Unknown => self.resets_at,
+        }
+    }
+
+    /// One line for the run summary: what rain left behind for the human.
+    pub fn summary_line(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(used) = self.five_hour_used {
+            parts.push(format!(
+                "5-hour window {:.0}% used{}",
+                used * 100.0,
+                resets_suffix(self.five_hour_resets_at)
+            ));
+        }
+        if let Some(used) = self.seven_day_used {
+            parts.push(format!(
+                "weekly {:.0}% used{}",
+                used * 100.0,
+                resets_suffix(self.seven_day_resets_at)
+            ));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+}
+
+fn resets_suffix(at: Option<DateTime<Utc>>) -> String {
+    match at {
+        Some(t) => format!(
+            " (resets {})",
+            t.with_timezone(&chrono::Local).format("%H:%M %a %e %b")
+        ),
+        None => String::new(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Outcome {
     Success,
@@ -129,6 +210,8 @@ pub struct AgentRun {
     pub duration: Duration,
     pub transcript: PathBuf,
     pub session_id: Option<String>,
+    /// The most recent quota reading from this session, if one was reported.
+    pub quota: Option<Quota>,
 }
 
 impl AgentRun {
@@ -262,6 +345,7 @@ pub fn run(spec: &AgentSpec) -> Result<AgentRun> {
         duration,
         transcript: spec.transcript.clone(),
         session_id: state.session_id.clone(),
+        quota: state.quota.clone(),
     })
 }
 
@@ -320,6 +404,7 @@ struct StreamState {
     num_turns: u64,
     cost_usd: f64,
     session_id: Option<String>,
+    quota: Option<Quota>,
 }
 
 impl StreamState {
@@ -345,6 +430,16 @@ impl StreamState {
                 }
             }
             Some("assistant") => self.report_assistant(&value),
+            Some("rate_limit_event") => {
+                if let Some(quota) = parse_quota(&value) {
+                    if quota.is_exhausted() {
+                        ui::warn(&format!("quota status: {}", quota.status));
+                    } else if let Some(line) = quota.summary_line() {
+                        ui::trace(&format!("quota: {line}"));
+                    }
+                    self.quota = Some(quota);
+                }
+            }
             Some("result") => {
                 self.saw_result = true;
                 self.result_subtype = value
@@ -427,19 +522,43 @@ fn classify(timed_out: bool, exit_code: i32, state: &StreamState, stderr: &str) 
         return Outcome::Timeout;
     }
 
-    // Only trust limit wording from rain's own channels — the process's stderr,
-    // or the agent's closing message when the run actually failed. A successful
-    // run whose text happens to discuss usage limits is not a usage limit.
+    let failed = state.is_error || exit_code != 0 || !state.saw_result;
+
+    // The stream's own quota telemetry is authoritative when it says we are cut
+    // off: it names the binding window and its reset time, so no backoff has to
+    // be guessed. Only trust it to end a run that actually failed — a session
+    // can report a limit on its closing event having already done its work.
+    if failed && let Some(quota) = state.quota.as_ref().filter(|q| q.is_exhausted()) {
+        return Outcome::UsageLimit(UsageLimit {
+            kind: quota.kind(),
+            resets_at: quota.reset_for_kind(),
+            message: format!("Claude Code reported quota status `{}`", quota.status),
+        });
+    }
+
+    // Otherwise fall back to the wording. Only trust limit wording from rain's
+    // own channels — the process's stderr, or the agent's closing message when
+    // the run failed. A successful run whose text happens to discuss usage
+    // limits is not a usage limit.
     let mut haystack = stderr.to_string();
-    if state.is_error || exit_code != 0 {
+    if failed {
         haystack.push('\n');
         haystack.push_str(&state.result_text);
     }
-    if let Some(limit) = detect_usage_limit(&haystack) {
+    if let Some(mut limit) = detect_usage_limit(&haystack) {
+        // Prefer a reset time the stream gave us over one scraped from text.
+        if limit.resets_at.is_none()
+            && let Some(quota) = &state.quota
+        {
+            limit.resets_at = quota.reset_for_kind();
+            if limit.kind == LimitKind::Unknown {
+                limit.kind = quota.kind();
+            }
+        }
         return Outcome::UsageLimit(limit);
     }
 
-    if state.saw_result && !state.is_error && exit_code == 0 {
+    if !failed {
         return Outcome::Success;
     }
 
@@ -455,6 +574,48 @@ fn classify(timed_out: bool, exit_code: i32, state: &StreamState, stderr: &str) 
         format!("the session failed (exit {exit_code})")
     };
     Outcome::Failed(reason)
+}
+
+/// Read a `rate_limit_event` message into a [`Quota`].
+fn parse_quota(value: &Value) -> Option<Quota> {
+    let info = value.get("rate_limit_info")?;
+    let windows = info.get("unifiedWindows");
+    let window = |name: &str, field: &str| -> Option<&Value> {
+        windows.and_then(|w| w.get(name)).and_then(|w| w.get(field))
+    };
+
+    Some(Quota {
+        status: info
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        limit_type: info
+            .get("rateLimitType")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        five_hour_used: window("five_hour", "utilization").and_then(Value::as_f64),
+        five_hour_resets_at: window("five_hour", "resetsAt").and_then(epoch_to_utc),
+        seven_day_used: window("seven_day", "utilization").and_then(Value::as_f64),
+        seven_day_resets_at: window("seven_day", "resetsAt").and_then(epoch_to_utc),
+        resets_at: info.get("resetsAt").and_then(epoch_to_utc),
+    })
+}
+
+/// Accept epoch seconds or milliseconds, as a number or a numeric string.
+fn epoch_to_utc(value: &Value) -> Option<DateTime<Utc>> {
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))?;
+    if raw <= 0 {
+        return None;
+    }
+    let secs = if raw > 100_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    };
+    Utc.timestamp_opt(secs, 0).single()
 }
 
 fn limit_re() -> &'static Regex {
@@ -597,6 +758,111 @@ mod tests {
     fn timeout_wins_over_everything() {
         let state = StreamState::default();
         assert!(matches!(classify(true, 0, &state, ""), Outcome::Timeout));
+    }
+
+    /// The shape Claude Code actually emits, captured from a live session.
+    const RATE_LIMIT_EVENT: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1789736400,"rateLimitType":"five_hour","overageStatus":"allowed","overageResetsAt":1790812800,"isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.14,"resetsAt":1789736400},"seven_day":{"utilization":0.16,"resetsAt":1790193600}}},"uuid":"6d0af5e7","session_id":"50b6903f"}"#;
+
+    fn quota_from(json: &str) -> Quota {
+        parse_quota(&serde_json::from_str::<Value>(json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reads_quota_telemetry_from_the_stream() {
+        let quota = quota_from(RATE_LIMIT_EVENT);
+        assert_eq!(quota.status, "allowed");
+        assert!(!quota.is_exhausted());
+        assert_eq!(quota.kind(), LimitKind::Session);
+        assert_eq!(quota.five_hour_used, Some(0.14));
+        assert_eq!(quota.seven_day_used, Some(0.16));
+        assert_eq!(
+            quota.five_hour_resets_at.unwrap().timestamp(),
+            1_789_736_400
+        );
+        assert_eq!(
+            quota.seven_day_resets_at.unwrap().timestamp(),
+            1_790_193_600
+        );
+        assert_eq!(quota.reset_for_kind(), quota.five_hour_resets_at);
+    }
+
+    #[test]
+    fn summarises_both_quota_windows() {
+        let line = quota_from(RATE_LIMIT_EVENT).summary_line().unwrap();
+        assert!(line.contains("5-hour window 14% used"), "got: {line}");
+        assert!(line.contains("weekly 16% used"), "got: {line}");
+    }
+
+    #[test]
+    fn a_weekly_exhaustion_reads_the_weekly_reset() {
+        let quota = quota_from(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","unifiedWindows":{"five_hour":{"utilization":0.2,"resetsAt":1789736400},"seven_day":{"utilization":1.0,"resetsAt":1790193600}}}}"#,
+        );
+        assert!(quota.is_exhausted());
+        assert_eq!(quota.kind(), LimitKind::Weekly);
+        assert_eq!(quota.reset_for_kind().unwrap().timestamp(), 1_790_193_600);
+    }
+
+    #[test]
+    fn quota_telemetry_drives_the_limit_verdict() {
+        let mut state = StreamState::default();
+        state.absorb(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1789736400,"unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":1789736400}}}}"#,
+        );
+        state.absorb(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"result":"stopped"}"#,
+        );
+
+        match classify(false, 1, &state, "") {
+            Outcome::UsageLimit(limit) => {
+                assert_eq!(limit.kind, LimitKind::Session);
+                assert_eq!(limit.resets_at.unwrap().timestamp(), 1_789_736_400);
+            }
+            other => panic!("expected a usage limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_allowed_quota_reading_never_stops_a_run() {
+        let mut state = StreamState::default();
+        state.absorb(RATE_LIMIT_EVENT);
+        state.absorb(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"done"}"#,
+        );
+        assert!(matches!(classify(false, 0, &state, ""), Outcome::Success));
+        assert_eq!(state.quota.as_ref().unwrap().five_hour_used, Some(0.14));
+    }
+
+    #[test]
+    fn a_failure_with_an_allowed_quota_is_an_ordinary_failure() {
+        let mut state = StreamState::default();
+        state.absorb(RATE_LIMIT_EVENT);
+        state.absorb(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"result":"the build broke"}"#,
+        );
+        assert!(matches!(classify(false, 1, &state, ""), Outcome::Failed(_)));
+    }
+
+    #[test]
+    fn quota_fills_in_a_reset_time_the_text_lacks() {
+        let mut state = StreamState::default();
+        state.absorb(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.99,"resetsAt":1789736400}}}}"#,
+        );
+        state.absorb(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"usage limit reached"}"#,
+        );
+        match classify(false, 1, &state, "") {
+            Outcome::UsageLimit(limit) => {
+                assert_eq!(limit.resets_at.unwrap().timestamp(), 1_789_736_400)
+            }
+            other => panic!("expected a usage limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_a_rate_limit_event_without_payload() {
+        assert!(parse_quota(&serde_json::json!({"type": "rate_limit_event"})).is_none());
     }
 
     #[test]

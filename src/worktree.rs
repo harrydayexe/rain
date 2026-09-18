@@ -24,11 +24,37 @@ pub struct Worktree {
     keep: bool,
 }
 
-/// Fetch the remote so worktrees branch from current refs.
+/// Fetch every branch into remote-tracking refs.
+///
+/// The refspec is explicit rather than inherited from the clone's config for
+/// two reasons. A `git clone --bare` has no fetch refspec at all and keeps
+/// branches in `refs/heads/*`, so `origin/main` would not resolve. And writing
+/// only to `refs/remotes/*` means a fetch can never move a `refs/heads/*`
+/// branch that one of our worktrees has checked out.
 pub fn fetch(ctx: &RepoContext) -> Result<()> {
     ui::info(&format!("fetching {}", ctx.remote));
-    git::run(&ctx.root, &["fetch", "--prune", &ctx.remote])
+    let refspec = format!("+refs/heads/*:refs/remotes/{}/*", ctx.remote);
+    git::run(&ctx.root, &["fetch", "--prune", &ctx.remote, &refspec])
         .with_context(|| format!("fetching from remote `{}`", ctx.remote))?;
+
+    let base_ref = ctx.base_ref();
+    git::run(&ctx.root, &["rev-parse", "--verify", "--quiet", &base_ref]).with_context(|| {
+        format!(
+            "`{}` does not exist on remote `{}` — check --base",
+            ctx.base_branch, ctx.remote
+        )
+    })?;
+    Ok(())
+}
+
+/// Refresh one branch's remote-tracking ref, for the base-branch safety check.
+pub fn fetch_base(ctx: &RepoContext) -> Result<()> {
+    let refspec = format!(
+        "+refs/heads/{base}:refs/remotes/{remote}/{base}",
+        base = ctx.base_branch,
+        remote = ctx.remote
+    );
+    git::run(&ctx.root, &["fetch", &ctx.remote, &refspec])?;
     Ok(())
 }
 

@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use serde::Serialize;
 
+use crate::agent::Quota;
 use crate::ui;
 use crate::util;
 
@@ -127,6 +128,8 @@ pub struct RunReport {
     pub total_cost_usd: f64,
     pub total_sessions: u32,
     pub slept_secs: u64,
+    /// The last quota reading of the run — what rain left for the human.
+    pub quota: Option<Quota>,
     pub run_dir: PathBuf,
 }
 
@@ -197,6 +200,9 @@ impl RunReport {
             ui::bold(&format!("${:.2}", self.total_cost_usd)),
             util::format_duration(Duration::from_secs(self.slept_secs)),
         ));
+        if let Some(line) = self.quota.as_ref().and_then(Quota::summary_line) {
+            ui::info(&format!("quota: {line}"));
+        }
         ui::info(&format!("full run record: {}", self.run_dir.display()));
         ui::blank();
     }
@@ -224,6 +230,10 @@ impl RunReport {
             self.total_cost_usd,
             util::format_duration(Duration::from_secs(self.slept_secs)),
         ));
+
+        if let Some(line) = self.quota.as_ref().and_then(Quota::summary_line) {
+            md.push_str(&format!("Quota after this run: {line}\n\n"));
+        }
 
         md.push_str(&format!(
             "Queue: {}\n\n",
@@ -325,6 +335,7 @@ mod tests {
             total_cost_usd: 1.0,
             total_sessions: 2,
             slept_secs: 0,
+            quota: None,
             run_dir: PathBuf::from("/tmp/run"),
         }
     }

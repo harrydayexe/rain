@@ -487,11 +487,10 @@ impl<'a> Pipeline<'a> {
     /// commits, in case it found a way around them.
     fn assert_base_untouched(&self, wt: &Worktree) -> Result<()> {
         let base = self.ctx.base_branch.clone();
-        if git::try_run(&self.ctx.root, &["fetch", &self.ctx.remote, &base])
-            .map(|o| !o.success())
-            .unwrap_or(true)
-        {
-            ui::trace("could not refresh the base branch for the safety check");
+        if let Err(e) = crate::worktree::fetch_base(self.ctx) {
+            ui::trace(&format!(
+                "could not refresh the base branch for the safety check: {e:#}"
+            ));
             return Ok(());
         }
 
