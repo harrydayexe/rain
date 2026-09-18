@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::agent::{AgentRun, AgentSpec, Effort, Outcome, Role};
+use crate::branch::{self, BranchPlan};
 use crate::ci::{self, CiOutcome};
 use crate::git;
 use crate::github::{Check, Forge, Issue};
@@ -36,6 +37,9 @@ pub struct Settings {
     pub max_ci_retries: u32,
     pub draft: bool,
     pub review: bool,
+    /// Whether to work on the branch GitHub has linked to an issue, rather than
+    /// cutting `rain/issue-N` next to it.
+    pub use_linked_branches: bool,
     pub worktree_root: PathBuf,
     pub run_dir: PathBuf,
     pub keep_worktrees: bool,
@@ -92,16 +96,33 @@ impl<'a> Pipeline<'a> {
     }
 
     fn execute(&mut self, issue: &Issue, report: &mut TaskReport) -> Result<()> {
+        let plan = branch::plan(
+            self.ctx,
+            self.forge,
+            issue.number,
+            self.settings.use_linked_branches,
+        );
+        report.branch = Some(plan.branch.clone());
+        report.base_branch = Some(plan.base_branch.clone());
+        report.branch_was_linked = plan.linked;
+        if plan.base_branch != self.ctx.base_branch {
+            report.note(format!(
+                "targeting `{}` rather than `{}`, taken from {}",
+                plan.base_branch,
+                self.ctx.base_branch,
+                plan.base_source.label()
+            ));
+        }
+
         let worktree = Worktree::create(
             self.ctx,
-            issue.number,
+            &plan,
             &self.settings.worktree_root,
             self.settings.keep_worktrees,
         )
         .with_context(|| format!("preparing a worktree for issue #{}", issue.number))?;
-        report.branch = Some(worktree.branch.clone());
 
-        let result = self.work(issue, report, &worktree);
+        let result = self.work(issue, report, &worktree, &plan);
 
         // Uncommitted changes would vanish with the worktree; keep it instead so
         // the human can look at what the agent left behind.
@@ -126,21 +147,39 @@ impl<'a> Pipeline<'a> {
         result
     }
 
-    fn work(&mut self, issue: &Issue, report: &mut TaskReport, wt: &Worktree) -> Result<()> {
+    fn work(
+        &mut self,
+        issue: &Issue,
+        report: &mut TaskReport,
+        wt: &Worktree,
+        plan: &BranchPlan,
+    ) -> Result<()> {
         // ── implement ────────────────────────────────────────────────────────
         ui::step(&format!("implementing #{}", issue.number));
-        let prompt =
-            prompts::implement(issue, self.forge.slug(), &wt.branch, &self.ctx.base_branch);
+        // Commits the branch arrived with are the agent's inheritance, not its
+        // output: the two are counted separately from here on.
+        let inherited = wt.commits_ahead(&wt.base_sha).unwrap_or(0);
+        let prompt = prompts::implement(
+            issue,
+            self.forge.slug(),
+            prompts::BranchBrief {
+                branch: &wt.branch,
+                base: &wt.base_branch,
+                existing_commits: inherited,
+                linked: plan.linked,
+            },
+        );
         let run = self.session(report, "implement", &wt.path, prompt, Role::Author)?;
         let handover = run.result_text.clone();
 
-        let commits = wt.commits_ahead(&wt.base_sha).unwrap_or(0);
+        let commits = wt.commits_ahead(&wt.start_sha).unwrap_or(0);
+        let total = wt.commits_ahead(&wt.base_sha).unwrap_or(commits);
         match &run.outcome {
             Outcome::Success => ui::ok(&format!(
-                "agent finished with {commits} commit{}",
+                "agent finished with {commits} new commit{}",
                 if commits == 1 { "" } else { "s" }
             )),
-            other if commits == 0 => {
+            other if total == 0 => {
                 let detail = describe_failure(other);
                 report.finish(
                     TaskStatus::Failed,
@@ -150,19 +189,29 @@ impl<'a> Pipeline<'a> {
             }
             other => {
                 report.note(format!(
-                    "the implementation session did not finish cleanly ({}), but left {commits} commit{}",
+                    "the implementation session did not finish cleanly ({}), but the branch has {total} commit{}",
                     describe_failure(other),
-                    if commits == 1 { "" } else { "s" }
+                    if total == 1 { "" } else { "s" }
                 ));
             }
         }
 
-        if commits == 0 {
+        if total == 0 {
             report.finish(
                 TaskStatus::Failed,
                 "the agent reported success but made no commits".to_string(),
             );
             return Ok(());
+        }
+
+        // A linked branch can arrive with the work already done on it. That is
+        // worth a pull request even though this session added nothing.
+        if commits == 0 {
+            report.note(format!(
+                "the agent made no new commits; continuing with the {total} commit{} already on `{}`",
+                if total == 1 { "" } else { "s" },
+                wt.branch
+            ));
         }
 
         self.assert_base_untouched(wt)?;
@@ -175,13 +224,20 @@ impl<'a> Pipeline<'a> {
         let pr = match self.forge.find_pr_for_branch(&wt.branch)? {
             Some(existing) => {
                 ui::info(&format!("reusing open PR #{}", existing.number));
+                // Retargeting someone else's pull request is not rain's call.
+                if !existing.base_ref.is_empty() && existing.base_ref != wt.base_branch {
+                    report.note(format!(
+                        "PR #{} already targets `{}` rather than `{}`; it was left as it is",
+                        existing.number, existing.base_ref, wt.base_branch
+                    ));
+                }
                 existing
             }
             None => self.forge.create_pr(
                 &wt.branch,
-                &self.ctx.base_branch,
+                &wt.base_branch,
                 &prompts::pr_title(issue),
-                &prompts::pr_body(issue, &handover),
+                &prompts::pr_body(issue, &handover, plan),
                 self.settings.draft,
             )?,
         };
@@ -486,15 +542,15 @@ impl<'a> Pipeline<'a> {
     /// branch; this checks that the base branch did not in fact grow any of our
     /// commits, in case it found a way around them.
     fn assert_base_untouched(&self, wt: &Worktree) -> Result<()> {
-        let base = self.ctx.base_branch.clone();
-        if let Err(e) = crate::worktree::fetch_base(self.ctx) {
+        let base = wt.base_branch.clone();
+        if let Err(e) = crate::worktree::fetch_base(self.ctx, &base) {
             ui::trace(&format!(
                 "could not refresh the base branch for the safety check: {e:#}"
             ));
             return Ok(());
         }
 
-        let base_ref = self.ctx.base_ref();
+        let base_ref = self.ctx.remote_ref(&base);
         let Ok(now) = git::run(&self.ctx.root, &["rev-parse", &base_ref]) else {
             return Ok(());
         };

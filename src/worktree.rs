@@ -1,13 +1,15 @@
 //! Per-issue worktrees.
 //!
-//! Every issue gets a fresh, disposable checkout branched from the remote's
-//! base branch. The agent only ever sees this directory, so nothing it does can
-//! reach a checkout the user is working in.
+//! Every issue gets a disposable checkout of its own — a fresh branch cut from
+//! the base branch, or the branch GitHub already has linked to the issue. The
+//! agent only ever sees this directory, so nothing it does can reach a checkout
+//! the user is working in.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::branch::BranchPlan;
 use crate::git;
 use crate::repo::RepoContext;
 use crate::ui;
@@ -17,9 +19,16 @@ use crate::ui;
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
-    /// The base branch commit this worktree was cut from. Used afterwards to
-    /// prove the agent never pushed to the base branch.
+    /// The branch this task's pull request targets.
+    pub base_branch: String,
+    /// The base branch's commit when the task started. Used afterwards to prove
+    /// the agent never pushed to the base branch.
     pub base_sha: String,
+    /// The branch's own tip when rain took it over. Equal to `base_sha` for a
+    /// branch rain cut itself, and ahead of it for a linked branch that already
+    /// carried work — which is what makes "did the agent commit anything?"
+    /// answerable in both cases.
+    pub start_sha: String,
     repo_root: PathBuf,
     keep: bool,
 }
@@ -48,10 +57,9 @@ pub fn fetch(ctx: &RepoContext) -> Result<()> {
 }
 
 /// Refresh one branch's remote-tracking ref, for the base-branch safety check.
-pub fn fetch_base(ctx: &RepoContext) -> Result<()> {
+pub fn fetch_base(ctx: &RepoContext, base: &str) -> Result<()> {
     let refspec = format!(
         "+refs/heads/{base}:refs/remotes/{remote}/{base}",
-        base = ctx.base_branch,
         remote = ctx.remote
     );
     git::run(&ctx.root, &["fetch", &ctx.remote, &refspec])?;
@@ -59,9 +67,9 @@ pub fn fetch_base(ctx: &RepoContext) -> Result<()> {
 }
 
 impl Worktree {
-    /// Create a worktree for `issue`, reclaiming anything a previous crashed run
-    /// left behind.
-    pub fn create(ctx: &RepoContext, issue: u64, root: &Path, keep: bool) -> Result<Self> {
+    /// Check out the branch `plan` settled on, reclaiming anything a previous
+    /// crashed run left behind.
+    pub fn create(ctx: &RepoContext, plan: &BranchPlan, root: &Path, keep: bool) -> Result<Self> {
         std::fs::create_dir_all(root)
             .with_context(|| format!("creating worktree directory {}", root.display()))?;
 
@@ -69,14 +77,13 @@ impl Worktree {
         // before asking whether a branch or path is free.
         let _ = git::try_run(&ctx.root, &["worktree", "prune"]);
 
-        let base_ref = ctx.base_ref();
+        let branch = plan.branch.clone();
+        let base_ref = ctx.remote_ref(&plan.base_branch);
         let base_sha = git::run(&ctx.root, &["rev-parse", &base_ref]).with_context(|| {
             format!("`{base_ref}` does not exist — has the remote been fetched?")
         })?;
 
-        let branch = pick_branch_name(ctx, issue);
         let path = root.join(branch.replace('/', "-"));
-
         if path.exists() {
             ui::warn(&format!(
                 "reclaiming a leftover worktree at {}",
@@ -85,33 +92,46 @@ impl Worktree {
             remove_worktree(&ctx.root, &path)?;
         }
 
-        ui::info(&format!(
-            "worktree {} on {branch} (from {base_ref} @ {})",
-            path.display(),
-            &base_sha[..base_sha.len().min(8)]
-        ));
+        if plan.linked {
+            ui::info(&format!(
+                "worktree {} on existing branch {branch} (merging into {base_ref})",
+                path.display()
+            ));
+            check_out_existing(ctx, &branch, &path)
+                .with_context(|| format!("checking out the existing branch `{branch}`"))?;
+        } else {
+            ui::info(&format!(
+                "worktree {} on {branch} (from {base_ref} @ {})",
+                path.display(),
+                &base_sha[..base_sha.len().min(8)]
+            ));
+            // `--no-track` matters: without it the new branch's upstream is the
+            // base branch, and a bare `git push` inside the worktree would
+            // target the base branch directly.
+            git::run(
+                &ctx.root,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    &branch,
+                    &path.to_string_lossy(),
+                    &base_ref,
+                ],
+            )
+            .with_context(|| format!("creating a worktree on `{branch}`"))?;
+        }
 
-        // `--no-track` matters: without it the new branch's upstream is the base
-        // branch, and a bare `git push` inside the worktree would target the
-        // base branch directly.
-        git::run(
-            &ctx.root,
-            &[
-                "worktree",
-                "add",
-                "--no-track",
-                "-b",
-                &branch,
-                &path.to_string_lossy(),
-                &base_ref,
-            ],
-        )
-        .with_context(|| format!("creating a worktree for issue #{issue}"))?;
+        let start_sha = git::run(&path, &["rev-parse", "HEAD"])
+            .with_context(|| format!("reading the tip of `{branch}`"))?;
 
         Ok(Self {
             path,
             branch,
+            base_branch: plan.base_branch.clone(),
             base_sha,
+            start_sha,
             repo_root: ctx.root.clone(),
             keep,
         })
@@ -186,6 +206,135 @@ impl Worktree {
     }
 }
 
+/// Put an existing branch — one GitHub linked to the issue — into a worktree.
+///
+/// Unlike a branch rain cut itself, this one may exist locally, remotely, or
+/// both, and the two copies may disagree. Tracking the same-named remote branch
+/// is safe here in a way tracking the base branch never is: a bare `git push`
+/// goes back where the branch came from.
+fn check_out_existing(ctx: &RepoContext, branch: &str, path: &Path) -> Result<()> {
+    let remote_ref = ctx.remote_ref(branch);
+    let has_local = git::probe(
+        &ctx.root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    );
+    let has_remote = git::probe(
+        &ctx.root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{}/{branch}", ctx.remote),
+        ],
+    );
+
+    if let Some(other) = checked_out_at(&ctx.root, branch) {
+        bail!(
+            "`{branch}` is already checked out at {} — rain will not take a branch out from under another worktree",
+            other.display()
+        );
+    }
+
+    if has_local {
+        git::run(
+            &ctx.root,
+            &["worktree", "add", &path.to_string_lossy(), branch],
+        )?;
+        if has_remote {
+            reconcile_with_remote(path, branch, &remote_ref)?;
+        }
+    } else {
+        if !has_remote {
+            bail!("`{branch}` exists neither locally nor on `{}`", ctx.remote);
+        }
+        git::run(
+            &ctx.root,
+            &[
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                branch,
+                &path.to_string_lossy(),
+                &remote_ref,
+            ],
+        )?;
+    }
+
+    if has_remote {
+        set_upstream(ctx, branch);
+    }
+    Ok(())
+}
+
+/// Point a branch at its own remote counterpart.
+///
+/// `git branch --set-upstream-to` refuses to do this in a bare clone: there is
+/// no fetch refspec — rain supplies one on each fetch — so git will not accept
+/// `origin/<branch>` as a remote-tracking branch. Writing the two configuration
+/// keys says exactly the same thing without that check. It is a convenience
+/// rather than a guarantee, since rain pushes with an explicit refspec either
+/// way, so a failure here is not worth stopping for.
+fn set_upstream(ctx: &RepoContext, branch: &str) {
+    let _ = git::try_run(
+        &ctx.root,
+        &["config", &format!("branch.{branch}.remote"), &ctx.remote],
+    );
+    let _ = git::try_run(
+        &ctx.root,
+        &[
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        ],
+    );
+}
+
+/// Bring a local branch up to its remote, or refuse to guess.
+///
+/// Fast-forwarding is the only safe reconciliation available: rain may not
+/// force-push, so work left on a diverged local branch could never be pushed,
+/// and discarding either side silently is worse than stopping.
+fn reconcile_with_remote(path: &Path, branch: &str, remote_ref: &str) -> Result<()> {
+    let (ahead, behind) = git::divergence(path, "HEAD", remote_ref)?;
+    match (ahead, behind) {
+        (_, 0) => Ok(()),
+        (0, _) => {
+            ui::info(&format!(
+                "fast-forwarding `{branch}` to {remote_ref} ({behind} commit(s))"
+            ));
+            git::run(path, &["merge", "--ff-only", remote_ref])
+                .with_context(|| format!("fast-forwarding `{branch}` to {remote_ref}"))?;
+            Ok(())
+        }
+        _ => bail!(
+            "the local and remote copies of `{branch}` have diverged ({ahead} commit(s) here, {behind} on {remote_ref}) — reconcile them before rain works this issue"
+        ),
+    }
+}
+
+/// Which worktree, if any, already has `branch` checked out.
+fn checked_out_at(repo_root: &Path, branch: &str) -> Option<PathBuf> {
+    let listed = git::run(repo_root, &["worktree", "list", "--porcelain"]).ok()?;
+    let wanted = format!("refs/heads/{branch}");
+    let mut current: Option<&str> = None;
+    for line in listed.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(path.trim());
+        } else if let Some(name) = line.strip_prefix("branch ")
+            && name.trim() == wanted
+        {
+            return current.map(PathBuf::from);
+        }
+    }
+    None
+}
+
 fn remove_worktree(repo_root: &Path, path: &Path) -> Result<()> {
     let out = git::try_run(
         repo_root,
@@ -204,32 +353,4 @@ fn remove_worktree(repo_root: &Path, path: &Path) -> Result<()> {
         bail!("{}", out.stderr);
     }
     Ok(())
-}
-
-/// `rain/issue-N`, suffixed if that name is already taken locally or remotely.
-fn pick_branch_name(ctx: &RepoContext, issue: u64) -> String {
-    let base = format!("rain/issue-{issue}");
-    if !branch_exists(ctx, &base) {
-        return base;
-    }
-    for suffix in 2..=50u32 {
-        let candidate = format!("{base}-{suffix}");
-        if !branch_exists(ctx, &candidate) {
-            ui::warn(&format!("`{base}` already exists; using `{candidate}`"));
-            return candidate;
-        }
-    }
-    // Fifty collisions means something is badly wrong, but a timestamped name is
-    // still better than failing the run outright.
-    let stamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-    format!("{base}-{stamp}")
-}
-
-fn branch_exists(ctx: &RepoContext, branch: &str) -> bool {
-    let local = format!("refs/heads/{branch}");
-    if git::probe(&ctx.root, &["show-ref", "--verify", "--quiet", &local]) {
-        return true;
-    }
-    let remote = format!("refs/remotes/{}/{branch}", ctx.remote);
-    git::probe(&ctx.root, &["show-ref", "--verify", "--quiet", &remote])
 }

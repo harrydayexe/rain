@@ -4,6 +4,7 @@
 //! already been through one round of automated review.
 
 pub mod agent;
+pub mod branch;
 pub mod ci;
 pub mod cli;
 pub mod deps;
@@ -40,6 +41,7 @@ pub fn run(opts: Options) -> Result<i32> {
     let forge = Forge::new(ctx.slug.clone());
     forge.preflight()?;
     ctx.base_branch = repo::resolve_base_branch(&ctx, opts.base.as_deref(), forge.default_branch());
+    ctx.base_explicit = opts.base.is_some();
 
     ui::ok(&format!(
         "{} — base branch `{}`, remote `{}`{}",
@@ -97,6 +99,7 @@ pub fn run(opts: Options) -> Result<i32> {
         max_ci_retries: opts.max_ci_retries,
         draft: opts.draft,
         review: opts.review,
+        use_linked_branches: opts.use_linked_branches,
         worktree_root,
         run_dir: run_dir.clone(),
         keep_worktrees: opts.keep_worktrees,

@@ -88,6 +88,11 @@ pub struct Cli {
     #[arg(long)]
     pub ignore_relationships: bool,
 
+    /// Always cut a new `rain/issue-N` branch, even where GitHub already has a
+    /// branch linked to the issue.
+    #[arg(long)]
+    pub ignore_linked_branches: bool,
+
     /// Keep worktrees after each issue, for debugging.
     #[arg(long)]
     pub keep_worktrees: bool,
@@ -120,6 +125,8 @@ pub struct Options {
     pub draft: bool,
     pub review: bool,
     pub ignore_relationships: bool,
+    /// Whether to work on a branch GitHub has linked to an issue.
+    pub use_linked_branches: bool,
     pub keep_worktrees: bool,
     pub dry_run: bool,
     pub verbose: bool,
@@ -170,6 +177,7 @@ impl Cli {
             draft: !self.ready,
             review: !self.no_review,
             ignore_relationships: self.ignore_relationships,
+            use_linked_branches: !self.ignore_linked_branches,
             keep_worktrees: self.keep_worktrees,
             dry_run: self.dry_run,
             verbose: self.verbose,
@@ -244,6 +252,16 @@ mod tests {
         assert!(!opts.draft);
         assert!(!opts.review);
         assert!(!opts.wait_on_limit);
+    }
+
+    #[test]
+    fn linked_branches_are_used_unless_refused() {
+        assert!(parse(&["1"]).unwrap().use_linked_branches);
+        assert!(
+            !parse(&["--ignore-linked-branches", "1"])
+                .unwrap()
+                .use_linked_branches
+        );
     }
 
     #[test]
