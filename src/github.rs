@@ -36,6 +36,18 @@ impl Issue {
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
+    /// The branch the pull request merges into.
+    pub base_ref: String,
+}
+
+/// A branch GitHub has linked to an issue, through the Development sidebar or
+/// the `create a branch` link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedBranch {
+    pub name: String,
+    /// `owner/name` of the repository the branch lives in. A linked branch can
+    /// live in a fork, which rain cannot work in.
+    pub repo: String,
 }
 
 /// A single CI check on a pull request.
@@ -110,9 +122,59 @@ struct RawRef {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawPr {
     number: u64,
     url: String,
+    #[serde(default)]
+    base_ref_name: String,
+}
+
+/// `{ "data": { "repository": { "issue": { "linkedBranches": … } } } }`, with
+/// every level optional because any of them can come back null.
+#[derive(Deserialize)]
+struct RawLinkedBranchResponse {
+    data: Option<RawLinkedBranchData>,
+}
+
+#[derive(Deserialize)]
+struct RawLinkedBranchData {
+    repository: Option<RawLinkedBranchRepo>,
+}
+
+#[derive(Deserialize)]
+struct RawLinkedBranchRepo {
+    issue: Option<RawLinkedBranchIssue>,
+}
+
+#[derive(Deserialize)]
+struct RawLinkedBranchIssue {
+    #[serde(rename = "linkedBranches")]
+    linked_branches: Option<RawLinkedBranchNodes>,
+}
+
+#[derive(Deserialize)]
+struct RawLinkedBranchNodes {
+    #[serde(default)]
+    nodes: Vec<RawLinkedBranchNode>,
+}
+
+#[derive(Deserialize)]
+struct RawLinkedBranchNode {
+    #[serde(rename = "ref")]
+    git_ref: Option<RawLinkedRef>,
+}
+
+#[derive(Deserialize)]
+struct RawLinkedRef {
+    name: String,
+    repository: Option<RawLinkedRepo>,
+}
+
+#[derive(Deserialize)]
+struct RawLinkedRepo {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
 }
 
 #[derive(Deserialize)]
@@ -309,6 +371,57 @@ impl Forge {
         Some(refs.into_iter().map(|r| r.number).collect())
     }
 
+    /// Branches GitHub has linked to `number`, in the order it reports them.
+    ///
+    /// Returns `None` when the query cannot be answered — the field is not on
+    /// every GitHub Enterprise version, and its absence is not an error any more
+    /// than a missing issue-dependencies API is.
+    pub fn linked_branches(&self, number: u64) -> Option<Vec<LinkedBranch>> {
+        const QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+repository(owner:$owner,name:$name){\
+issue(number:$number){\
+linkedBranches(first:20){nodes{ref{name repository{nameWithOwner}}}}}}}";
+
+        let owner = format!("owner={}", self.slug.owner);
+        let name = format!("name={}", self.slug.name);
+        let number_arg = format!("number={number}");
+        let query = format!("query={QUERY}");
+        let out = self
+            .try_gh(
+                &[
+                    "api",
+                    "graphql",
+                    "-f",
+                    &query,
+                    "-f",
+                    &owner,
+                    "-f",
+                    &name,
+                    "-F",
+                    &number_arg,
+                ],
+                None,
+            )
+            .ok()?;
+        if !out.success() {
+            ui::trace(&format!(
+                "linked branches unavailable for #{number}: {}",
+                ui::clip(&out.message(), 120)
+            ));
+            return None;
+        }
+        match parse_linked_branches(&out.stdout) {
+            Some(branches) => Some(branches),
+            None => {
+                ui::trace(&format!(
+                    "could not read the linked branches of #{number} from: {}",
+                    ui::clip(&out.stdout, 120)
+                ));
+                None
+            }
+        }
+    }
+
     /// The open PR for `branch`, if rain (or anyone) already opened one.
     pub fn find_pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
         let json = self.gh(&[
@@ -323,12 +436,13 @@ impl Forge {
             "--limit",
             "1",
             "--json",
-            "number,url",
+            "number,url,baseRefName",
         ])?;
         let prs: Vec<RawPr> = serde_json::from_str(&json).context("parsing PR list JSON")?;
         Ok(prs.into_iter().next().map(|p| PullRequest {
             number: p.number,
             url: p.url,
+            base_ref: p.base_ref_name,
         }))
     }
 
@@ -462,6 +576,37 @@ impl Forge {
     }
 }
 
+/// Read the linked branches out of the GraphQL response.
+///
+/// `None` means the shape was not what we asked for — a GraphQL error, or a
+/// field this GitHub does not have. An issue with no linked branches is
+/// `Some(vec![])`, which is a different answer and leads to a different
+/// decision.
+fn parse_linked_branches(json: &str) -> Option<Vec<LinkedBranch>> {
+    let response: RawLinkedBranchResponse = serde_json::from_str(json).ok()?;
+    let linked = response
+        .data?
+        .repository?
+        .issue?
+        .linked_branches
+        .map(|l| l.nodes)
+        .unwrap_or_default();
+    Some(
+        linked
+            .into_iter()
+            .filter_map(|node| node.git_ref)
+            .filter(|r| !r.name.trim().is_empty())
+            .map(|r| LinkedBranch {
+                name: r.name,
+                repo: r
+                    .repository
+                    .map(|repo| repo.name_with_owner)
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    )
+}
+
 /// Pull the Actions run ID out of a check's details URL.
 fn extract_run_id(link: &str) -> Option<String> {
     let after = link.split("/actions/runs/").nth(1)?;
@@ -485,6 +630,61 @@ mod tests {
         );
         assert_eq!(extract_run_id("https://example.com/build/7"), None);
         assert_eq!(extract_run_id(""), None);
+    }
+
+    #[test]
+    fn reads_linked_branches() {
+        let json = r#"{"data":{"repository":{"issue":{"linkedBranches":{"nodes":[
+            {"ref":{"name":"v3-changes-config","repository":{"nameWithOwner":"o/n"}}},
+            {"ref":{"name":"fork-side","repository":{"nameWithOwner":"someone/n"}}}
+        ]}}}}}"#;
+        let branches = parse_linked_branches(json).expect("a well-formed response parses");
+        assert_eq!(
+            branches,
+            vec![
+                LinkedBranch {
+                    name: "v3-changes-config".into(),
+                    repo: "o/n".into()
+                },
+                LinkedBranch {
+                    name: "fork-side".into(),
+                    repo: "someone/n".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_issue_with_no_linked_branches_is_an_empty_list() {
+        let json = r#"{"data":{"repository":{"issue":{"linkedBranches":{"nodes":[]}}}}}"#;
+        assert_eq!(parse_linked_branches(json), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_deleted_linked_ref_is_skipped() {
+        let json = r#"{"data":{"repository":{"issue":{"linkedBranches":{"nodes":[
+            {"ref":null},
+            {"ref":{"name":"live","repository":null}}
+        ]}}}}}"#;
+        let branches = parse_linked_branches(json).unwrap();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "live");
+        assert!(branches[0].repo.is_empty());
+    }
+
+    /// The distinction that matters: "GitHub cannot answer" is not "no linked
+    /// branches", because only one of them means rain should cut its own.
+    #[test]
+    fn an_unanswerable_query_is_not_an_empty_list() {
+        assert_eq!(
+            parse_linked_branches(r#"{"errors":[{"message":"unknown field"}]}"#),
+            None
+        );
+        assert_eq!(
+            parse_linked_branches(r#"{"data":{"repository":null}}"#),
+            None
+        );
+        assert_eq!(parse_linked_branches("not json at all"), None);
     }
 
     #[test]

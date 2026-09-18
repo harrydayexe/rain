@@ -73,6 +73,11 @@ pub struct TaskReport {
     /// One line explaining the status.
     pub detail: String,
     pub branch: Option<String>,
+    /// The branch this task's pull request targets, which is not always the
+    /// run's base branch.
+    pub base_branch: Option<String>,
+    /// Whether `branch` was already linked to the issue on GitHub.
+    pub branch_was_linked: bool,
     pub pr: Option<u64>,
     pub pr_url: Option<String>,
     pub ci_fix_attempts: u32,
@@ -92,6 +97,8 @@ impl TaskReport {
             status: TaskStatus::Failed,
             detail: String::new(),
             branch: None,
+            base_branch: None,
+            branch_was_linked: false,
             pr: None,
             pr_url: None,
             ci_fix_attempts: 0,
@@ -274,7 +281,17 @@ impl RunReport {
                     md.push_str(&format!("- Pull request: [#{n}]({url})\n"));
                 }
                 if let Some(branch) = &task.branch {
-                    md.push_str(&format!("- Branch: `{branch}`\n"));
+                    md.push_str(&format!(
+                        "- Branch: `{branch}`{}\n",
+                        if task.branch_was_linked {
+                            " (already linked to the issue)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                if let Some(base) = &task.base_branch {
+                    md.push_str(&format!("- Merges into: `{base}`\n"));
                 }
                 md.push_str(&format!("- CI fix attempts: {}\n", task.ci_fix_attempts));
                 md.push_str(&format!(

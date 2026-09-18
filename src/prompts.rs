@@ -3,6 +3,7 @@
 //! These are the tool's actual interface to the model, so they live in one file
 //! where they can be read end to end and changed deliberately.
 
+use crate::branch::{BaseSource, BranchPlan};
 use crate::github::{Check, Issue};
 use crate::repo::RepoSlug;
 
@@ -27,8 +28,60 @@ If you genuinely cannot finish, commit and push whatever coherent partial work y
 explain precisely what is left in your final message. A clear account of an incomplete job is \
 far more useful than a broken or invented one.";
 
+/// What the agent needs to know about the branch it has been put on.
+#[derive(Debug, Clone, Copy)]
+pub struct BranchBrief<'a> {
+    pub branch: &'a str,
+    /// The branch the pull request will merge into.
+    pub base: &'a str,
+    /// Commits already on the branch when rain took it over.
+    pub existing_commits: usize,
+    /// Whether the branch was already linked to the issue on GitHub, rather
+    /// than cut for it by rain.
+    pub linked: bool,
+}
+
+impl BranchBrief<'_> {
+    /// The paragraph that tells the agent where it is standing.
+    fn situation(&self) -> String {
+        if !self.linked {
+            return format!(
+                "You are in a fresh git worktree on branch `{}`, cut from `{}`. The working tree is \
+clean and the branch has no commits of its own yet.",
+                self.branch, self.base
+            );
+        }
+        let history = if self.existing_commits == 0 {
+            "It has no commits of its own yet.".to_string()
+        } else {
+            format!(
+                "It already carries {n} commit{s} that `{base}` does not have. Read {them} with \
+`git log --stat {base}..HEAD` before you change anything, and continue that work rather than \
+starting again or undoing it.",
+                n = self.existing_commits,
+                s = if self.existing_commits == 1 { "" } else { "s" },
+                base = self.base,
+                them = if self.existing_commits == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+            )
+        };
+        format!(
+            "You are in a git worktree on branch `{branch}`, which is already linked to this issue \
+on GitHub — it is where a human expects this work to appear, so do not create another branch. Its \
+pull request will merge into `{base}`, not necessarily the repository's default branch, so treat \
+`{base}` as the baseline for everything you do. The working tree is clean. {history}",
+            branch = self.branch,
+            base = self.base,
+            history = history,
+        )
+    }
+}
+
 /// The opening prompt: read the issue, implement it, commit, push.
-pub fn implement(issue: &Issue, slug: &RepoSlug, branch: &str, base: &str) -> String {
+pub fn implement(issue: &Issue, slug: &RepoSlug, brief: BranchBrief<'_>) -> String {
     format!(
         "Implement GitHub issue #{number} in the repository {slug}.
 
@@ -40,8 +93,7 @@ Labels: {labels}
 {body}
 </issue-body>
 
-You are in a fresh git worktree on branch `{branch}`, cut from `{base}`. The working tree is \
-clean and the branch has no commits of its own yet.
+{situation}
 
 Do this:
 1. Read the issue above carefully and decide what \"done\" means for it. The issue is the \
@@ -78,8 +130,8 @@ it, and anything a reviewer should look at closely.",
         } else {
             issue.body.trim()
         },
-        branch = branch,
-        base = base,
+        situation = brief.situation(),
+        branch = brief.branch,
     )
 }
 
@@ -211,12 +263,24 @@ In your final message, list each review point and say whether you fixed it or de
 }
 
 /// The body of the pull request rain opens.
-pub fn pr_body(issue: &Issue, handover: &str) -> String {
+pub fn pr_body(issue: &Issue, handover: &str, plan: &BranchPlan) -> String {
     let notes = handover.trim();
     let notes = if notes.is_empty() {
         "_The agent did not leave a handover note._"
     } else {
         notes
+    };
+    // A pull request that does not target the default branch needs to say why,
+    // where the person reviewing it will see it.
+    let target = match plan.base_source {
+        BaseSource::Default => String::new(),
+        BaseSource::OpenPullRequest => String::new(),
+        BaseSource::Inferred => format!(
+            "\n>\n> It targets `{base}` rather than the default branch: `{branch}` was already \
+linked to the issue, and its history says it was cut from `{base}`.",
+            base = plan.base_branch,
+            branch = plan.branch,
+        ),
     };
     format!(
         "Closes #{number}
@@ -224,7 +288,7 @@ pub fn pr_body(issue: &Issue, handover: &str) -> String {
 > [!NOTE]
 > This pull request was written by [rain](https://github.com/harrydayexe/rain) running Claude \
 Code. It has not been reviewed by a human. CI and an automated review pass run before it is \
-handed over.
+handed over.{target}
 
 ## Issue
 
@@ -238,6 +302,7 @@ handed over.
         title = issue.title,
         url = issue.url,
         notes = notes,
+        target = target,
     )
 }
 
@@ -296,14 +361,33 @@ mod tests {
         }
     }
 
+    fn fresh_brief() -> BranchBrief<'static> {
+        BranchBrief {
+            branch: "rain/issue-12",
+            base: "main",
+            existing_commits: 0,
+            linked: false,
+        }
+    }
+
+    fn plan(base: &str, source: BaseSource) -> BranchPlan {
+        BranchPlan {
+            branch: "rain/issue-12".into(),
+            base_branch: base.into(),
+            base_source: source,
+            linked: source != BaseSource::Default,
+        }
+    }
+
     #[test]
     fn implement_prompt_carries_the_issue() {
         let slug = RepoSlug::parse("o/n").unwrap();
-        let p = implement(&issue(), &slug, "rain/issue-12", "main");
+        let p = implement(&issue(), &slug, fresh_brief());
         assert!(p.contains("#12"));
         assert!(p.contains("It should retry three times."));
         assert!(p.contains("rain/issue-12"));
         assert!(p.contains("git push -u origin rain/issue-12"));
+        assert!(p.contains("fresh git worktree"));
     }
 
     #[test]
@@ -311,7 +395,66 @@ mod tests {
         let slug = RepoSlug::parse("o/n").unwrap();
         let mut i = issue();
         i.body = "  ".into();
-        assert!(implement(&i, &slug, "b", "main").contains("no description"));
+        let brief = BranchBrief {
+            branch: "b",
+            ..fresh_brief()
+        };
+        assert!(implement(&i, &slug, brief).contains("no description"));
+    }
+
+    #[test]
+    fn implement_prompt_explains_a_linked_branch_with_work_on_it() {
+        let slug = RepoSlug::parse("o/n").unwrap();
+        let p = implement(
+            &issue(),
+            &slug,
+            BranchBrief {
+                branch: "feature/uploader",
+                base: "v3-changes",
+                existing_commits: 2,
+                linked: true,
+            },
+        );
+        assert!(p.contains("already linked to this issue"));
+        assert!(p.contains("do not create another branch"));
+        assert!(p.contains("2 commits"));
+        assert!(p.contains("git log --stat v3-changes..HEAD"));
+        assert!(p.contains("merge into `v3-changes`"));
+        assert!(!p.contains("fresh git worktree"));
+    }
+
+    #[test]
+    fn implement_prompt_counts_one_existing_commit_in_the_singular() {
+        let slug = RepoSlug::parse("o/n").unwrap();
+        let p = implement(
+            &issue(),
+            &slug,
+            BranchBrief {
+                branch: "feature/uploader",
+                base: "main",
+                existing_commits: 1,
+                linked: true,
+            },
+        );
+        assert!(p.contains("1 commit that"));
+        assert!(p.contains("Read it with"));
+    }
+
+    #[test]
+    fn implement_prompt_handles_an_empty_linked_branch() {
+        let slug = RepoSlug::parse("o/n").unwrap();
+        let p = implement(
+            &issue(),
+            &slug,
+            BranchBrief {
+                branch: "feature/uploader",
+                base: "v3-changes",
+                existing_commits: 0,
+                linked: true,
+            },
+        );
+        assert!(p.contains("no commits of its own yet"));
+        assert!(!p.contains("git log --stat"));
     }
 
     #[test]
@@ -328,9 +471,36 @@ mod tests {
 
     #[test]
     fn pr_body_closes_the_issue() {
-        let body = pr_body(&issue(), "Added a retry loop.");
+        let body = pr_body(
+            &issue(),
+            "Added a retry loop.",
+            &plan("main", BaseSource::Default),
+        );
         assert!(body.contains("Closes #12"));
         assert!(body.contains("Added a retry loop."));
+        assert!(!body.contains("rather than the default branch"));
+    }
+
+    #[test]
+    fn pr_body_explains_an_inferred_target_branch() {
+        let body = pr_body(
+            &issue(),
+            "Added a retry loop.",
+            &plan("v3-changes", BaseSource::Inferred),
+        );
+        assert!(body.contains("It targets `v3-changes` rather than the default branch"));
+        assert!(body.contains("cut from `v3-changes`"));
+    }
+
+    /// A base someone chose themselves on the pull request needs no explaining.
+    #[test]
+    fn pr_body_says_nothing_about_a_base_that_came_from_the_pull_request() {
+        let body = pr_body(
+            &issue(),
+            "note",
+            &plan("v3-changes", BaseSource::OpenPullRequest),
+        );
+        assert!(!body.contains("rather than the default branch"));
     }
 
     #[test]

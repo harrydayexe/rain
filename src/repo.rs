@@ -54,13 +54,22 @@ pub struct RepoContext {
     pub is_bare: bool,
     pub remote: String,
     pub slug: RepoSlug,
+    /// The branch pull requests target unless a task works out a better one.
     pub base_branch: String,
+    /// Whether `base_branch` came from `--base`. An explicit flag is an
+    /// instruction, so it overrides anything a task infers for itself.
+    pub base_explicit: bool,
 }
 
 impl RepoContext {
     /// `origin/main` — the ref new worktrees branch from.
     pub fn base_ref(&self) -> String {
-        format!("{}/{}", self.remote, self.base_branch)
+        self.remote_ref(&self.base_branch)
+    }
+
+    /// `origin/<branch>` — the remote-tracking ref for any branch.
+    pub fn remote_ref(&self, branch: &str) -> String {
+        format!("{}/{}", self.remote, branch)
     }
 }
 
@@ -157,6 +166,7 @@ pub fn discover(
         remote,
         slug,
         base_branch: String::new(), // filled in by `resolve_base_branch`
+        base_explicit: false,
     })
 }
 
