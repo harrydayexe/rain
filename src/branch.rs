@@ -246,14 +246,31 @@ pub fn infer_parent(ctx: &RepoContext, branch: &str) -> Option<String> {
 /// relative to: cut `feature` from `v3-changes` and `feature` is three commits
 /// ahead of `v3-changes`, but three plus the whole of `v3-changes` ahead of
 /// `main`. Ties go to the run's base branch, because when the history cannot
-/// tell two branches apart the conservative target is the one the user named.
+/// tell two branches apart the conservative target is the one the user named,
+/// and then to a branch whose name does not start with a digit: GitHub names
+/// the branch it creates for an issue `<number>-<title>`, so a tied candidate
+/// like `2-buzbar` is another issue's untouched branch sitting on the same
+/// commit, never the branch this one was cut from.
 pub fn rank<'a>(candidates: &'a [Candidate], base_branch: &str) -> Option<&'a Candidate> {
     candidates
         .iter()
         // A candidate that already contains every commit we have is downstream
         // of us, not upstream: a pull request into it would be empty.
         .filter(|c| !(c.ahead == 0 && c.behind > 0))
-        .min_by_key(|c| (c.ahead, c.name != base_branch, c.behind, c.name.as_str()))
+        .min_by_key(|c| {
+            (
+                c.ahead,
+                c.name != base_branch,
+                looks_like_an_issue_branch(&c.name),
+                c.behind,
+                c.name.as_str(),
+            )
+        })
+}
+
+/// Whether a branch name looks like one GitHub cut for an issue, i.e. `1-foo`.
+fn looks_like_an_issue_branch(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Remote branches worth measuring, most recently updated first.
@@ -373,6 +390,37 @@ mod tests {
         // …and is deterministic when even that ties.
         let level = [candidate("beta", 3, 1), candidate("alpha", 3, 1)];
         assert_eq!(rank(&level, "main").unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn a_tie_prefers_a_branch_that_is_not_another_issues_branch() {
+        // Issue #1's branch and issue #2's branch were both cut from `baz` and
+        // neither has been worked on, so all three tips are the same commit.
+        // `2-buzbar` is a sibling, not a parent.
+        let candidates = [
+            candidate("2-buzbar", 0, 0),
+            candidate("baz", 0, 0),
+            candidate("main", 5, 0),
+        ];
+        assert_eq!(rank(&candidates, "main").unwrap().name, "baz");
+    }
+
+    #[test]
+    fn an_issue_branch_still_wins_when_the_history_says_so() {
+        // Only the digit-led name is a plausible parent: it is the one we have
+        // fewest commits beyond, which outranks the naming heuristic.
+        let candidates = [candidate("3-stacked-on", 2, 0), candidate("main", 9, 0)];
+        assert_eq!(rank(&candidates, "main").unwrap().name, "3-stacked-on");
+    }
+
+    #[test]
+    fn a_digit_led_base_branch_still_wins_its_ties() {
+        // The user named it, so it outranks the naming heuristic.
+        let candidates = [candidate("2024-release", 3, 0), candidate("other", 3, 0)];
+        assert_eq!(
+            rank(&candidates, "2024-release").unwrap().name,
+            "2024-release"
+        );
     }
 
     #[test]
